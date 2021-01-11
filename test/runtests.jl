@@ -139,3 +139,27 @@ end
     @test size(hdr["y"]) == ()
     @test eltype(hdr["y"]) == eltype(npzread(f, ["y"])["y"])
 end
+
+@testset "F_CONTIGUOUS and C_CONTIGUOUS" begin
+    mktempdir() do dir
+        f = joinpath(dir, "temp")
+        a = reshape(1:12, 3, 4)
+        
+        npzwrite(f, NPZ.F_CONTIGUOUS(a))
+        @test npzread(f) == a
+        
+        npzwrite(f, NPZ.C_CONTIGUOUS(a))
+        @test npzread(f) == a'
+        @test npzread(f, f_contiguous = false) == a
+
+        npzwrite(f, af = NPZ.F_CONTIGUOUS(a), ac = NPZ.C_CONTIGUOUS(a))
+        
+        arrs = npzread(f)
+        @test arrs["af"] == a
+        @test arrs["ac"] == a'
+
+        arrs = npzread(f, f_contiguous = false)
+        @test arrs["af"] == a
+        @test arrs["ac"] == a
+    end
+end

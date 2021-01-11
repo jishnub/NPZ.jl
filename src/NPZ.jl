@@ -58,6 +58,17 @@ else
     end
 end
 
+abstract type ArrayLayout{A} end
+struct F_CONTIGUOUS{A} <: ArrayLayout{A}
+    arr :: A
+end
+struct C_CONTIGUOUS{A} <: ArrayLayout{A}
+    arr :: A
+end
+
+Base.ndims(::ArrayLayout{A}) where {A} = ndims(A)
+Base.parent(A::ArrayLayout) = A.arr
+
 # Julia2Numpy is a dictionary that uses Types as keys.
 # This is problematic for precompilation because the
 # hash of a Type changes everytime Julia is run.
@@ -226,22 +237,24 @@ function readheader(f::IO)
     parseheader(strip(hdr))
 end
 
-function _npzreadarray(f, hdr::Header{T}) where {T}
+function _npzreadarray(f, hdr::Header{T}, f_contiguous::Bool = true) where {T}
     toh = hdr.descr
     if hdr.fortran_order
         @compat x = map(toh, read!(f, Array{T}(undef, hdr.shape)))
     else
         @compat x = map(toh, read!(f, Array{T}(undef, reverse(hdr.shape))))
-        if ndims(x) > 1
-            x = permutedims(x, collect(ndims(x):-1:1))
+        if f_contiguous
+            if ndims(x) > 1
+                x = permutedims(x, collect(ndims(x):-1:1))
+            end
         end
     end
     ndims(x) == 0 ? x[1] : x
 end
 
-function npzreadarray(f::IO)
+function npzreadarray(f::IO, f_contiguous::Bool = true)
     hdr = readheader(f)
-    _npzreadarray(f, hdr)
+    _npzreadarray(f, hdr, f_contiguous)
 end
 
 function samestart(a::AbstractVector, b::AbstractVector)
@@ -258,12 +271,22 @@ function _maybetrimext(name::AbstractString)
 end
 
 """
-    npzread(filename::AbstractString, [vars])
+    npzread(filename::AbstractString, [vars::Vector]; [f_contiguous = true])
 
 Read a variable or a collection of variables from `filename`. 
 The input needs to be either an `npy` or an `npz` file.
 The optional argument `vars` is used only for `npz` files.
 If it is specified, only the matching variables are read in from the file.
+
+Arrays in Python usually follow a row-major layout in memory, 
+while those in Julia follow a column-major layout.
+The argument `f_contiguous` decides if an array written out 
+in python is permuted while being read in.
+If `f_contiguous` is `true`, an array written out in python will 
+be read back in identically in julia.
+If `f_contiguous` is set of `false`, the array will be transposed.
+The latter preserves the contiguity of array elements across languages. 
+The flag makes no difference while reading in column-major (`F_CONTIGUOUS` in numpy) arrays.
 
 !!! note "Zero-dimensional arrays"
     Zero-dimensional arrays are stripped while being read in, and the values that they
@@ -284,19 +307,58 @@ julia> npzread("temp.npz", ["x"]) # Reads only "x"
 Dict{String,Array{Float64,1}} with 1 entry:
   "x" => [1.0, 1.0, 1.0]
 ```
+
+# Examples of `f_contiguous`
+
+Write out a row-major (`C_CONTIGUOUS`) array in python
+
+```python
+>>> import numpy as np
+
+>>> a = np.reshape([i for i in range(1,13)], (4,3))
+
+>>> a
+array([[ 1,  2,  3],
+       [ 4,  5,  6],
+       [ 7,  8,  9],
+       [10, 11, 12]])
+
+>>> np.save("temp.npy", a)
+```
+
+Read it back in Julia by preserving the indices of elements:
+
+```julia
+julia> npzread("temp.npy", f_contiguous = true)
+4×3 Array{Int64,2}:
+  1   2   3
+  4   5   6
+  7   8   9
+ 10  11  12
+```
+
+Read it back in Julia by preserving the contiguity of elements (resulting in a transpose):
+
+```julia
+julia> npzread("temp.npy", f_contiguous = false)
+3×4 Array{Int64,2}:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
+```
 """
-function npzread(filename::AbstractString, vars...)
+function npzread(filename::AbstractString, vars...; f_contiguous::Bool = true)
     # Detect if the file is a numpy npy array file or a npz/zip file.
     f = open(filename)
     @compat b = read!(f, Vector{UInt8}(undef, MaxMagicLen))
 
     if samestart(b, ZIPMagic)
         fz = ZipFile.Reader(filename)
-        data = npzread(fz, vars...)
+        data = npzread(fz, vars...; f_contiguous = f_contiguous)
         close(fz)
     elseif samestart(b, NPYMagic)
         seekstart(f)
-        data = npzreadarray(f)
+        data = npzreadarray(f, f_contiguous)
     else
         close(f)
         error("not a NPY or NPZ/Zip file: $filename")
@@ -306,9 +368,9 @@ function npzread(filename::AbstractString, vars...)
 end
 
 function npzread(dir::ZipFile.Reader, 
-    vars = map(f -> _maybetrimext(f.name), dir.files))
+    vars = map(f -> _maybetrimext(f.name), dir.files); f_contiguous::Bool = true)
 
-    Dict(_maybetrimext(f.name) => npzreadarray(f)
+    Dict(_maybetrimext(f.name) => npzreadarray(f, f_contiguous)
         for f in dir.files 
             if f.name in vars || _maybetrimext(f.name) in vars)
 end
@@ -348,8 +410,13 @@ function readheader(dir::ZipFile.Reader,
             if f.name in vars || _maybetrimext(f.name) in vars)
 end
 
-function npzwritearray(
-    f::IO, x::AbstractArray{UInt8}, T::DataType, shape)
+_metahdr(x::F_CONTIGUOUS, shape) = "'fortran_order': True, 'shape': $(Tuple(shape))"
+_metahdr(x::C_CONTIGUOUS, shape) = "'fortran_order': False, 'shape': $(reverse(Tuple(shape)))"
+function metahdr(x::ArrayLayout, descr, shape)
+    "{'descr': '$descr', " * _metahdr(x, shape) * ", }"
+end
+
+function npzwritearray(f::IO, x::ArrayLayout, T::DataType, shape)
 
     if !haskey(Julia2Numpy, T)
         error("unsupported type $T")
@@ -358,7 +425,7 @@ function npzwritearray(
     writele(f, Version)
 
     descr =  (ENDIAN_BOM == 0x01020304 ? ">" : "<") * Julia2Numpy[T]
-    dict = "{'descr': '$descr', 'fortran_order': True, 'shape': $(Tuple(shape)), }"
+    dict = metahdr(x, descr, shape)
 
     # The dictionary is padded with enough whitespace so that
     # the array data is 16-byte aligned
@@ -370,24 +437,36 @@ function npzwritearray(
 
     writele(f, UInt16(length(dict)))
     writele(f, dict)
-    if write(f, x) != length(x)
+    y = parent(x)
+    N = write(f, y)
+    if N != length(y)
         error("short write")
     end
 end
 
-function npzwritearray(f::IO, x::AbstractArray)
-    npzwritearray(f, reinterpret(UInt8, vec(x)), eltype(x), size(x))
-end
+_to1D(x::Number) = [x]
+_to1D(a::AbstractArray) = vec(a)
 
-function npzwritearray(f::IO, x::Number)
-    npzwritearray(f, reinterpret(UInt8, [x]), typeof(x), ())
+for DT in [:F_CONTIGUOUS, :C_CONTIGUOUS]
+    @eval function npzwritearray(f, x::$DT)
+        y = parent(x)
+        npzwritearray(f, $DT(reinterpret(UInt8, _to1D(y))), eltype(y), size(y))
+    end
 end
+# by default arrays are written out in the column-major convention
+npzwritearray(f::IO, x::Union{AbstractArray, Number}) = npzwritearray(f, F_CONTIGUOUS(x))
 
 """
     npzwrite(filename::AbstractString, x)
 
 Write the variable `x` to the `npy` file `filename`. 
 Unlike `numpy`, the extension `.npy` is not appened to `filename`.
+
+The variable `x` may be wrapped in the tags `NPZ.F_CONTIGUOUS` or `NPZ.C_CONTIGUOUS` to 
+explicitly specify the layout in memory that is to be assumed while reading it back in. 
+The former indicates that it is to be interpreted as a column-major array, 
+whereas the latter states that it is to be interpreted as a row-major one.
+The default choice implicit in the function is `NPZ.F_CONTIGUOUS`.
 
 !!! warn "Warning"
     Any existing file with the same name will be overwritten.
@@ -402,6 +481,88 @@ julia> npzread("abc.npy")
  0.0
  0.0
  0.0
+```
+
+# Examples of the usage of `F_CONTIGUOUS` and `C_CONTIGUOUS`
+
+### `F_CONTIGUOUS`
+
+```julia
+julia> a = reshape(1:12, 3, 4)
+3×4 reshape(::UnitRange{Int64}, 3, 4) with eltype Int64:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
+```
+
+Write out an array with the `F_CONTIGUOUS` tag:
+```julia
+julia> npzwrite("temp.npy", NPZ.F_CONTIGUOUS(a))
+
+julia> npzread("temp.npy") # always read in identically in julia
+3×4 Array{Int64,2}:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
+```
+
+The array is read in identically in python, except the memory layout is now column-major.
+
+```python
+>>> import numpy as np
+
+>>> np.load("temp.npy")
+array([[ 1,  4,  7, 10],
+       [ 2,  5,  8, 11],
+       [ 3,  6,  9, 12]])
+
+>>> np.load("temp.npy").strides
+(8, 24)
+```
+
+### `C_CONTIGUOUS`
+
+Write out an array with the `C_CONTIGUOUS` tag:
+
+```julia
+julia> npzwrite("temp.npy", NPZ.C_CONTIGUOUS(a))
+```
+
+`C_CONTIGUOUS` arrays are transposed by default while being read back using [`npzread`](@ref):
+
+```julia
+julia> npzread("temp.npy")
+4×3 Array{Int64,2}:
+  1   2   3
+  4   5   6
+  7   8   9
+ 10  11  12
+```
+
+To avoid the transpose and read in the original array that was written out, 
+specify the tag `f_contiguous = false`:
+
+```julia
+julia> npzread("temp.npy", f_contiguous = false)
+3×4 Array{Int64,2}:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
+```
+
+The array is read in as a row-major one in python. As a consequence the matrix is transposed.
+
+```python
+>>> import numpy as np
+
+>>> np.load("temp.npy")
+array([[ 1,  2,  3],
+       [ 4,  5,  6],
+       [ 7,  8,  9],
+       [10, 11, 12]])
+
+>>> np.load(f).strides
+(24, 8)
 ```
 """
 function npzwrite(filename::AbstractString, x)
@@ -419,6 +580,12 @@ In the first form, write the variables in `vars` to an `npz` file named `filenam
 In the second form, collect the variables in `args` and `kwargs` and write them all
 to `filename`. The variables in `args` are saved with names `arr_0`, `arr_1` 
 and so on, whereas the ones in `kwargs` are saved with the specified names.
+
+Each variable to be written out may be wrapped in `NPZ.F_CONTIGUOUS` or `NPZ.C_CONTIGUOUS` to 
+explicitly specify the layout in memory that is to be assumed while reading it back in. 
+The former indicates that the variable is to be interpreted 
+as a column-major array, whereas the latter states that it is to be interpreted as a 
+row-major one. The default choice implicit in the function is `NPZ.F_CONTIGUOUS`.
 
 Unlike `numpy`, the extension `.npz` is not appened to `filename`.
 
@@ -442,6 +609,38 @@ Dict{String,Any} with 3 entries:
   "arr_0" => [1.0 1.0; 1.0 1.0]
   "x"     => [1.0, 1.0, 1.0]
   "y"     => 3
+```
+
+# Examples of the usage of `F_CONTIGUOUS` and `C_CONTIGUOUS`
+
+Write out arrays in julia
+```julia
+julia> a = reshape(1:12, 3, 4)
+3×4 reshape(::UnitRange{Int64}, 3, 4) with eltype Int64:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
+
+julia> npzwrite("temp.npz", ac = NPZ.C_CONTIGUOUS(a), af = NPZ.F_CONTIGUOUS(a))
+
+julia> npzread("temp.npz")["af"] # F_CONTIGUOUS arrays are read back in identically
+3×4 Array{Int64,2}:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
+
+julia> npzread("temp.npz")["ac"] # C_CONTIGUOUS arrays are transposed by default
+4×3 Array{Int64,2}:
+  1   2   3
+  4   5   6
+  7   8   9
+ 10  11  12
+
+julia> npzread("temp.npz", f_contiguous = false)["ac"] # read the original array back without a transposition
+3×4 Array{Int64,2}:
+ 1  4  7  10
+ 2  5  8  11
+ 3  6  9  12
 ```
 """
 function npzwrite(filename::AbstractString, vars::Dict{<:AbstractString}) 
